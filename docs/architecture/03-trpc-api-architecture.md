@@ -86,6 +86,32 @@ Prisma Client → PostgreSQL
 3. **Middleware**: Xử lý trước/sau procedure (auth, logging, rate-limit...)
 4. **Context**: Shared data giữa procedures (user, session, prisma...)
 
+#### 🧠 Ý đồ & lý do thiết kế
+- Tập trung type-safety end-to-end để giảm số lượng bug runtime giữa web ↔ server, đặc biệt khi domain cal.com mở rộng liên tục (booking, team, payments…).
+- Loại bỏ codegen giúp CI/CD nhanh và hạn chế “drift” giữa schema và client, điều thường xảy ra khi dùng OpenAPI/GraphQL codegen.
+- SuperJSON được cấu hình từ đầu để không phải viết custom serializer cho những entity chứa `Date/Map/Set`, vốn xuất hiện rất nhiều trong lịch đặt lịch, availability và setting.
+- Phân lớp rõ ràng: client → Next API handler → router → middleware → procedure → Prisma. Mục tiêu là biết chính xác logic nằm ở đâu và debug theo lớp.
+
+#### ⚖️ Trade-offs & lựa chọn khác
+- **REST Next.js API Routes**: đơn giản hơn cho dev mới, nhưng tốn công type sharing (cần openapi types hoặc tự viết), dễ bị drift giữa client/server, khó batch và khó compose middleware type-safe.
+- **GraphQL**: mạnh khi cần query linh hoạt, nhưng Cal đa phần là các hành động business rõ ràng (create booking, update availability). GraphQL thêm chi phí schema, resolver boilerplate, codegen, cache complexity. tRPC cho phép giữ type inference và code nhỏ gọn.
+- **Drop-in Prisma calls trong React Query hooks**: nhanh nhưng phá vỡ boundary server/client, mất bảo vệ auth ở server, khó audit/observability vì logic tản mác per-component.
+- **Không dùng SuperJSON**: JSON thuần sẽ mất fidelity với `Date/BigInt`, đòi hỏi manual serialize/parse ở nhiều nơi → dễ sai lệch timezone và rounding số dư credits/payments.
+
+#### 🧪 Tình huống maintain thực tế
+- Khi thêm feature mới (ví dụ “booking labels”), dev chỉ cần thêm router/procedure và Zod schema, client tự infer type. Không phải cập nhật swagger hay file types riêng.
+- Khi refactor business logic, việc có context và middleware tách biệt giúp di chuyển code (auth, tracing) mà không chạm vào tất cả procedure handlers.
+- Debug production: traceContext trong context giúp gắn trace-id vào Sentry/observability, lần theo call chain.
+
+#### 🐛 Pitfalls & lưu ý
+- Quên dùng Zod → mất validation runtime, dễ đẩy crash vào client.
+- Serialize thủ công `Date`/`BigInt` trong mutation result thay vì tin tưởng SuperJSON → dễ tạo double-serialization.
+- Chạm trực tiếp Prisma từ client hoặc bypass tRPC → mất auth/rate-limit, gây lộ data.
+
+#### 🔧 Gợi ý khi mở rộng trong tương lai
+- Nếu domain tăng mạnh, cân nhắc thêm lớp service (pure TS) để tách procedure mỏng và dễ reuse giữa routers khác.
+- Bổ sung tracing sớm cho router hot-path (bookings/eventTypes) để tránh bottleneck khi khối lượng tăng.
+
 ---
 
 ## 2. Router Hierarchy
@@ -198,6 +224,31 @@ Examples:
 - `publicViewerRouter`: Public endpoints (no auth)
 - `heavyEventTypesRouter`: Heavy operations (separate to avoid timeout)
 
+#### 🧠 Ý đồ & lý do thiết kế
+- `viewerRouter` làm “root” cho 40+ router vì mọi hành động đều gắn với “viewer” (người dùng hiện tại), kể cả khi có chế độ public. Điều này giữ namespace phẳng, dễ tìm, và dễ batch nhiều query trong một request.
+- Phân tách routers theo domain (bookings, eventTypes, teams, payments…) giúp mỗi router giữ phạm vi nghiệp vụ rõ ràng; new dev chỉ cần grep domain để tìm entrypoint.
+- `heavyEventTypesRouter` tách riêng để cô lập các thao tác nặng (generate slots, bulk availability) tránh làm chậm các mutations nhẹ. Đây là tín hiệu kiến trúc cho thấy performance là concern đầu tiên.
+- `loggedInViewerRouter` xuất hiện để phục vụ SSR: một số page cần biết viewer ngay trong server render; router phụ này đảm bảo hook SSR an toàn mà không lẫn lộn với client-only routers.
+
+#### ⚖️ Trade-offs & lựa chọn khác
+- **Một root router duy nhất không có namespace viewer**: rút gọn path nhưng khó phân biệt public/authed và khó tránh đụng tên khi có 40+ routers.
+- **Tách appRouter thành nhiều root (adminRouter, publicRouter)**: rõ ràng nhưng phản tác dụng batching; client phải tạo nhiều TRPC client hoặc link, mất đơn giản.
+- **Sử dụng Next.js API routes cho từng domain**: cho phép caching CDN tốt hơn, nhưng mất type inference và batching. Với ~40 routers thì số file endpoint sẽ nổ và middleware phải lặp lại.
+
+#### 🧪 Tình huống maintain thực tế
+- Thêm procedure mới vào `bookingsRouter`: thường phải chạm `packages/trpc/server/routers/viewer/bookings.ts`, định nghĩa Zod input, dùng `authedProcedure`. Có thể cần cập nhật React Query hooks tại `packages/trpc/react` hoặc app web để invalidate cache liên quan.
+- Đổi logic auth (thêm role mới, ví dụ `SUPPORT_AGENT`): cần xem routers nào cần role này. Điều chỉnh middleware hoặc tạo middleware mới rồi dùng `.use` tại các router domain (teams/admin). Namespace rõ ràng giúp tìm nơi cắm middleware.
+- Khi domain lớn dần, nếu một router vượt quá ~300-400 dòng, team thường split ra các file nhỏ trong thư mục router (ví dụ bookings/queries.ts, bookings/mutations.ts) nhưng vẫn export gộp để giữ API path ổn định.
+
+#### 🐛 Pitfalls & lưu ý
+- Đặt procedure mới sai namespace (ví dụ logic team lại đặt trong bookings) sẽ gây nhầm lẫn cache key phía client và khó tìm khi debug.
+- Bỏ qua `heavyEventTypesRouter` và thêm thao tác nặng vào router thường → dễ timeout hoặc chậm toàn bộ batch request.
+- Quy ước naming: lẫn lộn giữa `viewer` và `public` router có thể khiến endpoint public vô tình yêu cầu auth hoặc ngược lại.
+
+#### 🔧 Gợi ý khi mở rộng trong tương lai
+- Áp dụng “feature folder” cho router phình to: ví dụ `/viewer/bookings/` chứa `queries.ts`, `mutations.ts`, `validation.ts`, `index.ts` để export router. Điều này giữ path ổn nhưng tách file rõ hơn.
+- Khi bắt đầu có nhiều tổ chức/tenant, cân nhắc namespace bổ sung (ví dụ `viewer.org`) hoặc middleware kiểm tra orgId thống nhất để giảm lặp code kiểm tra org trên từng procedure.
+
 ---
 
 ## 3. Context Creation
@@ -305,6 +356,31 @@ export async function createContextInner(
 - **Testing**: Don't need to mock `req`/`res`
 - **SSR Helpers**: `createServerSideHelpers` doesn't have `req`/`res`
 - **Reusability**: Can be used outside of Next.js
+
+#### 🧠 Ý đồ & lý do thiết kế
+- `createContext` nhận `req/res` để tích hợp Next API handler, còn `createContextInner` tách phần thuần data (session, locale, prisma) nhằm tái sử dụng cho SSR (không có req/res) và unit test.
+- Đặt Prisma và `insightsDb` trong context để mọi procedure dùng cùng instance/connection pool, tránh tạo mới mỗi request. `insightsDb` read-only giúp tách workload analytics khỏi traffic chính.
+- `traceContext` sinh ra sớm trong context để middleware/procedure có thể log cùng traceId, giảm chi phí debug khi batch nhiều call.
+- `sourceIp` và `locale` được tính sớm để middleware (logging, rate-limit) có đủ thông tin mà không đụng vào handler.
+
+#### ⚖️ Trade-offs & lựa chọn khác
+- **Context tối giản chỉ có user**: đỡ nặng nhưng thiếu thông tin cho tracing/perf và khó mở rộng khi thêm features như insights/stats.
+- **Khởi tạo Prisma mới per request**: tránh shared pool nhưng gây overhead kết nối, nguy cơ connection storm. Cal chọn singleton và rely vào connection pooling của Prisma.
+- **Không tách inner context**: code đơn giản hơn nhưng test/SSR phải mock `req/res`, tăng boilerplate.
+
+#### 🧪 Tình huống maintain thực tế
+- Thêm trường mới vào `TRPCContext` (ví dụ `featureFlags`): thêm vào `createContextInner`, rồi merge trong `createContext`. Nếu field cần `req`, thêm ở `createContext` và spread vào return.
+- Thay đổi cách lấy session (ví dụ migrate sang khác provider): cập nhật `sessionGetter` trong API handler và logic `getUserSession`, không phải chạm từng procedure.
+- Khi thêm DB read replica mới cho một domain (analytics), có thể thêm client mới vào context và chỉ router liên quan dùng client đó.
+
+#### 🐛 Pitfalls & lưu ý
+- Luôn ensure middleware không mutate trực tiếp `ctx.prisma` hoặc shared objects; nếu cần override, trả về `next({ ctx: { prisma: ... } })` để giữ kiểu.
+- `createContext` chạy per request; tránh logic nặng (ví dụ fetch external) ở đây, đưa vào middleware/procedure nếu cần cache.
+- Quên pass `locale` hoặc `session` khi dùng `createContextInner` trong tests/SSR sẽ dẫn tới fallback sai locale hoặc lỗi auth ngầm.
+
+#### 🔧 Gợi ý khi mở rộng trong tương lai
+- Chuẩn hóa schema context trong `.agents/` hoặc shared types để new dev nắm nhanh biến có sẵn.
+- Có thể thêm `requestId`/`sessionFingerprint` ở context để phục vụ rate-limit hoặc audit, dùng chung cho middlewares.
 
 ---
 
@@ -446,6 +522,31 @@ export const orgRouter = router({
 ```
 
 ---
+
+#### 🧠 Ý đồ & lý do thiết kế
+- `publicProcedure` giữ tối giản để endpoints public không bị dính middleware không cần thiết; cũng là baseline cho pipeline `.use(...)`.
+- `authedProcedure` luôn kèm `perfMiddleware → isAuthed` nhằm chuẩn hóa logging/perf cho mọi call có auth. Cấu hình ở một nơi, tránh quên log/perf ở từng handler.
+- `authedAdminProcedure`/`authedOrgAdminProcedure` dựng từ `publicProcedure.use(...)` thay vì copy/paste logic vào handler để đảm bảo kiểu context sau middleware được thu hẹp chính xác (`user` luôn tồn tại, role đã check).
+- Pipeline middleware cho phép thêm bước mới (rate-limit, feature flags) mà không chỉnh vào handler, giảm nguy cơ lặp error handling.
+
+#### ⚖️ Trade-offs & lựa chọn khác
+- **Nhúng auth check vào handler**: linh hoạt hơn với logic tùy biến, nhưng dễ quên check hoặc trả sai code. Middleware đảm bảo tính thống nhất.
+- **Một loại authed duy nhất (không tách admin/org)**: đơn giản hơn, nhưng buộc check role trong từng handler → noisy và dễ sai phạm quyền.
+- **Không dùng SuperJSON**: sẽ phải manually map `Date`/`BigInt` trong procedure output, gây duplication.
+
+#### 🧪 Tình huống maintain thực tế
+- Khi thêm procedure booking mới cần auth: start từ `authedProcedure` để có `ctx.user`. Nếu logic chỉ dành cho org admin, chuyển sang `authedOrgAdminProcedure`.
+- Khi thay đổi logic perf (ví dụ thêm tracing span), chỉ cần chỉnh `perfMiddleware`; mọi `authedProcedure` hưởng lợi mà không phải tìm tay 40+ routers.
+- Nếu thêm role mới (e.g., `SUPPORT_AGENT`) cần quyền đọc booking: tạo middleware mới (ví dụ `isSupportAgent`) và áp dụng `.use` trong router/phương thức phù hợp.
+
+#### 🐛 Pitfalls & lưu ý
+- Dùng nhầm `publicProcedure` cho endpoint lộ dữ liệu nhạy cảm → phải review path `viewer.*` để đảm bảo auth. Quy tắc: bất kỳ endpoint đụng user data phải dùng `authedProcedure` ít nhất.
+- Quên define `.input(z.object(...))` sẽ khiến client nhận type `any`, mất type safety.
+- Return dữ liệu Prisma thô có thể chứa field không nên expose (token, secret). Nên `select` hoặc map kết quả.
+
+#### 🔧 Gợi ý khi mở rộng trong tương lai
+- Tạo helpers `protectedMutation`/`protectedQuery` (wrapper authedProcedure) để đặt mặc định behavior caching hoặc audit trail cho các domain nhạy cảm (payments, admin).
+- Xem xét tách layer service để procedure mỏng và dễ test: `bookingService.confirm(...)` gọi trong handler, service testable độc lập.
 
 ## 5. Middlewares
 
@@ -626,6 +727,30 @@ export default perfMiddleware;
 
 **Purpose**: Monitor procedure execution time
 
+#### 🧠 Ý đồ & lý do thiết kế
+- Middleware gom auth/perf vào pipeline để tránh lặp trong handler và đảm bảo mọi endpoint quan trọng đều được log/tracked.
+- `unstable_pipe` cho phép xây chuỗi linh hoạt: `perfMiddleware → isAuthed → isAdminMiddleware`. Type inference cập nhật context theo từng bước, giảm lỗi “ctx.user undefined”.
+- `isAuthed` enrich session/user sớm, đồng thời set Sentry user để việc theo dõi lỗi chính xác theo user.
+
+#### ⚖️ Trade-offs & lựa chọn khác
+- **Middleware global** (áp dụng ở root) thay vì gắn vào procedure: gọn hơn nhưng khó phân biệt public vs authed, và overhead cho endpoints public.
+- **Logging trong handler**: linh hoạt nhưng dễ bị bỏ sót. Middleware đảm bảo coverage 100%.
+- **PerfMiddleware console.log**: nhanh để debug, nhưng cho production nên gửi sang logger tập trung; Cal chọn middleware riêng để có thể swap implementation mà không đổi handler.
+
+#### 🧪 Tình huống maintain thực tế
+- Thêm rate-limit: tạo middleware mới (ví dụ `rateLimitMiddleware`) và chèn vào pipeline cần thiết (`authedProcedure.use(rateLimitMiddleware)` hoặc chỉ một số router nặng như bookings).
+- Đổi rule admin: chỉnh `isAdminMiddleware` (hoặc tạo middleware khác) thay vì sửa từng handler admin.
+- Khi muốn bổ sung feature flags: middleware có thể đọc `ctx.session`, `ctx.user`, thêm `ctx.flags` rồi pass xuống handler, không đổi signature procedure.
+
+#### 🐛 Pitfalls & lưu ý
+- Quên `return next({ ctx: ... })` khi cần override context → context không cập nhật, gây bug type và runtime.
+- Middleware async nên bọc try/catch nếu có side effect; nếu throw, error formatter sẽ xử lý nhưng cần đảm bảo không để leak thông tin nhạy cảm.
+- Đừng mutate `ctx` trực tiếp mà hãy trả object mới để tRPC merge; tránh race condition khi context shared trong test.
+
+#### 🔧 Gợi ý khi mở rộng trong tương lai
+- Chuẩn hóa logger thay vì `console.log` trong perfMiddleware; gửi traceId, userId, path, duration để dễ truy vấn.
+- Thêm middleware “schema guard” cho headers (sử dụng Zod) nếu cần enforce request metadata (ví dụ version, client-id) đồng nhất.
+
 ---
 
 ## 6. Sub-Routers Deep Dive
@@ -746,7 +871,35 @@ export const viewerTeamsRouter = router({
 });
 ```
 
----
+
+#### 🧠 Ý đồ & lý do thiết kế
+- **Bookings**: router trung tâm vì toàn bộ business xoay quanh đặt lịch. Chia query/mutation rõ ràng giúp React Query caching chính xác. Schema input phức tạp (time zone, recurring) đặt trong `booking*Schema` để tái dùng giữa nhiều procedure.
+- **EventTypes**: tách router “heavy” để cô lập các truy vấn tốn kém (nhiều join). Mục tiêu: bảo vệ UX khỏi timeout và cho phép tối ưu riêng (caching, background preparation).
+- **Teams**: router lồng `teamWebhooksRouter`, `teamWorkflowsRouter` để gom toàn bộ lifecycle theo team. Điều này phản ánh domain: mỗi team có webhook/workflow riêng, tránh nhầm lẫn với webhook toàn hệ thống.
+
+#### ⚖️ Trade-offs & lựa chọn khác
+- **Ghép bookings + eventTypes chung router**: ít file hơn nhưng domain lẫn lộn; cache keys khó tách; review khó vì logic dài.
+- **Không tách heavy router**: code đơn giản hơn nhưng batch request dễ bị giữ lâu bởi một query chậm; user sẽ thấy toàn bộ batch delay.
+- **Dùng service layer tách khỏi tRPC**: sạch hơn về kiến trúc, nhưng thêm abstraction. Hiện tại Cal ưu tiên tốc độ phát triển, nhưng vẫn giữ schema và helper để không “đổ logic” vào handler.
+
+#### 🧪 Tình huống maintain thực tế
+- Thêm procedure booking: cập nhật schema (Zod), handler, sau đó xem lại client invalidation (`viewer.bookings.*`) và email/notification trigger nếu có. Thường cần động vào Prisma `Booking` model khi thêm field.
+- Thêm field mới vào Prisma `Booking` và expose: 
+  1) Update Prisma schema + migration. 
+  2) Update Zod schema và select trong `bookingsRouter` (tránh `select: {}` toàn bộ). 
+  3) Update React components sử dụng, invalidate query liên quan.
+- Chuyển logic permission team: thay đổi `teamWorkflowsRouter`/`teamWebhooksRouter` để check role (OWNER/ADMIN). Có thể thêm middleware riêng cho team để không lặp role check.
+- Khi refactor event type scheduling logic, kiểm tra cả router thường và router heavy, vì client có thể gọi bất kỳ cái nào tùy view.
+
+#### 🐛 Pitfalls & lưu ý
+- Đừng trả về toàn bộ record Prisma mặc định, đặc biệt với bookings/eventTypes chứa metadata/secret. Luôn dùng `select`/`pick`.
+- Event type “heavy” có thể chạy lâu; tránh gọi nó trong batch chung với mutation quan trọng để không tăng latency toàn batch.
+- Team routers thường yêu cầu org/team context; nếu không dùng middleware để populate org info, handler dễ truy cập nhầm team khác.
+
+#### 🔧 Gợi ý khi mở rộng trong tương lai
+- Chuẩn hóa naming schema/hàm trong từng router (`list`, `get`, `create`, `update`, `delete`) để new dev đoán được API.
+- Tách `bookingsRouter` thành file nhỏ (queries/mutations/notifications) khi code vượt quá giới hạn đọc. Vẫn export router gộp để giữ path ổn định.
+- Xem xét layer service dùng chung giữa bookings và eventTypes (ví dụ tính availability) để tránh duplication khi thêm loại lịch mới.
 
 ## 7. Error Handling
 
@@ -842,7 +995,30 @@ export const deleteBooking = authedProcedure
   });
 ```
 
----
+
+#### 🧠 Ý đồ & lý do thiết kế
+- Error formatter chuẩn hóa Zod errors để client hiển thị field errors dễ dàng (flatten). Điều này giảm custom parsing ở frontend.
+- Sử dụng `TRPCError` với code chuẩn nhằm map chính xác sang HTTP tương đương và UI state (401 → redirect login, 403 → thông báo permission).
+- Đưa message ngắn gọn, không leak thông tin nhạy cảm (IDs, queries) để an toàn cho logs client.
+
+#### ⚖️ Trade-offs & lựa chọn khác
+- **Ném Error thường**: đơn giản nhưng client không biết status code, khó phân biệt validation vs auth vs internal.
+- **Formatter phức tạp hơn (include stack)**: hữu ích cho dev, nhưng dễ lộ thông tin trong production; Cal giữ formatter mỏng, rely Sentry để xem stack.
+- **Dùng HTTP exceptions (Next API)**: bỏ qua layer tRPC, mất lợi thế type-safety và batching.
+
+#### 🧪 Tình huống maintain thực tế
+- Khi thêm validation mới bằng Zod, kiểm tra UI đã đọc `zodError` chưa; nếu UI dùng toast generic, cân nhắc map lỗi field để form hiển thị.
+- Khi đổi thông điệp lỗi (ví dụ policy mới), sửa trong handler nhưng vẫn giữ code chuẩn; tránh đổi code tùy ý vì client dựa vào code để xác định hành động.
+- Nếu thêm rate-limit middleware, cân nhắc throw `TOO_MANY_REQUESTS` để UI có thể hiển thị “thử lại sau” thay vì generic error.
+
+#### 🐛 Pitfalls & lưu ý
+- Không nên return boolean để biểu đạt lỗi; luôn throw `TRPCError` để formatter và React Query error flow hoạt động chuẩn.
+- Đừng embed error raw từ Prisma/HTTP third-party vào message gửi client; log nội bộ bằng logger/trace thay vì expose.
+- Lỗi auth/permission phải dùng `UNAUTHORIZED/ FORBIDDEN` rõ ràng; nếu dùng `BAD_REQUEST`, UI sẽ hiểu sai.
+
+#### 🔧 Gợi ý khi mở rộng trong tương lai
+- Chuẩn hóa helper `assertOrgAdmin`/`assertOwnsBooking` để throw lỗi consistent, giảm duplication.
+- Tùy route quan trọng (payments), có thể thêm error wrapper gắn mã lỗi nội bộ (`errorCode`) để hỗ trợ hỗ trợ khách hàng.
 
 ## 8. Client-Side Usage
 
@@ -1075,6 +1251,34 @@ export async function getServerSideProps(context) {
 
 ---
 
+#### 🧠 Ý đồ & lý do thiết kế
+- Gắn chặt tRPC với React Query để dùng chung cache, retry, background refetch. Với 40+ routers, cache key ổn định (`viewer.*`) giúp giảm call trùng và hỗ trợ optimistic update.
+- `httpBatchLink` giảm số request HTTP khi có nhiều query song song (trang dashboard tải bookings, eventTypes, teams cùng lúc).
+- SuperJSON cũng được dùng phía client để deserialize `Date`/`BigInt`, tránh thủ công `new Date(...)` trong component.
+- SSR dùng `createServerSideHelpers` + `createContextInner` để prefetch data trong Next.js App Router/Pages Router mà không cần `req/res`, đồng thời giữ type-safety.
+
+#### ⚖️ Trade-offs & lựa chọn khác
+- **SWR/Apollo**: SWR nhẹ hơn nhưng cần adapter cho tRPC; Apollo dành cho GraphQL, không phù hợp. React Query phù hợp nhất cho pattern query/mutation hiện tại.
+- **Không batch**: giảm complexity nhưng tốn kết nối; với dashboards nhiều widget, batch tiết kiệm latency đáng kể.
+- **useSWR direct fetch** (bỏ tRPC hooks): mất type inference và cache key thống nhất, dễ đụng nhau.
+
+#### 🧪 Tình huống maintain thực tế
+- Thêm mutation mới: sau khi tạo procedure, dùng `trpc.viewer.x.useMutation` và nhớ invalidation (`utils.viewer.x.list.invalidate()`). Nếu data ảnh hưởng nhiều query, tạo helper invalidate chung.
+- Khi sửa input schema, IDE sẽ báo lỗi ở client; cập nhật hook call. Kiểm tra đặc biệt với infinite queries (`useInfiniteQuery`) về `getNextPageParam`.
+- Migrate component từ pages → app router: vẫn dùng provider `TRPCProvider` ở root layout; SSR prefetch đổi sang `fetchRequestHandler` hoặc helper tương ứng.
+
+#### 🐛 Pitfalls & lưu ý
+- Dùng nhầm `useQuery` cho mutation (hoặc ngược lại) sẽ gây side effects không mong muốn và cache mismatch.
+- Không invalidate cache sau mutation → UI hiển thị dữ liệu cũ (đặc biệt bookings/eventTypes list). Dùng `utils` để invalidate đúng scope.
+- Khi dùng optimistic update, nhớ rollback trong `onError`; nếu không, cache sẽ sai và cần hard reload.
+- Infinite query: đảm bảo server trả `nextCursor`; nếu không, client sẽ fetch vô hạn hoặc stop sai.
+
+#### 🔧 Gợi ý khi mở rộng trong tương lai
+- Chuẩn hóa `useBookingListOptions` (hook wrappers) để tái dùng options `staleTime`, `select`, `enabled`, giảm lặp cấu hình React Query.
+- Thiết lập logger cho tRPC client để theo dõi batch và errors trong dev; hữu ích cho onboarding dev mới.
+
+---
+
 ## 9. Best Practices
 
 ### 9.1. Input Validation
@@ -1197,7 +1401,30 @@ describe("Bookings Router", () => {
 });
 ```
 
----
+
+#### 🧠 Ý đồ & lý do thiết kế
+- Best practices nhấn vào validation, context safe, performance, error handling, testing để new dev có checklist khi thêm/đổi procedure.
+- Cấu trúc ưu tiên “fail fast” (Zod) và “least privilege” (authedProcedure, select fields) để giảm nguy cơ lộ dữ liệu.
+- Testing qua `createCaller` cho phép chạy procedure như client thực sự nhưng không cần HTTP, nhanh và type-safe.
+
+#### ⚖️ Trade-offs & lựa chọn khác
+- **Bỏ validation**: code ngắn hơn nhưng bug dữ liệu (slug sai, timezone sai) sẽ len lỏi vào DB và UI.
+- **Select * trong Prisma**: tiện nhưng tăng payload, có thể expose secret. Cal chọn select tối thiểu, đặc biệt với bookings/eventTypes chứa metadata.
+- **Không viết test tRPC**: tiết kiệm thời gian ngắn hạn, nhưng khi refactor dễ phá flow booking; `createCaller` là compromise tốt giữa tốc độ và độ tin cậy.
+
+#### 🧪 Tình huống maintain thực tế
+- Khi thêm hook mới, kiểm tra xem nên `enabled` condition hay không (ví dụ chỉ fetch khi có `id`). Tránh query chạy vô nghĩa.
+- Khi tối ưu performance, đầu tiên audit select fields và index; sau đó mới nghĩ đến caching hoặc splitting router heavy.
+- Khi chạy test, nếu cần user khác roles, tạo session mock tương ứng để đảm bảo middleware role hoạt động.
+
+#### 🐛 Pitfalls & lưu ý
+- Không invalidate cache sau mutation hoặc invalidate sai scope (`viewer.bookings.list` vs `viewer.bookings.get`) dẫn đến UI stale.
+- Dùng `ctx.user?.id` trong authedProcedure sẽ làm type `number | undefined`, mất lợi thế type narrowing; dựa vào context đã được middleware gán.
+- Test bỏ qua middleware (tạo context với user null) khiến kết quả test khác thực tế; luôn tạo context giống production.
+
+#### 🔧 Gợi ý khi mở rộng trong tương lai
+- Tạo template snippet (VSCode) cho procedure mới bao gồm Zod schema, input typing, select fields, error handling chuẩn.
+- Thêm guideline invalidation cho từng domain (bookings, eventTypes, teams) để dev mới biết phải invalidate những query nào khi mutation thành công.
 
 ## 📝 Thay đổi trong PHASE 3
 
